@@ -14,6 +14,86 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QPalette, QColor, QFont
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 
+
+class MarketAnalysisThread(QThread):
+    analysis_complete = pyqtSignal(dict)
+
+    def __init__(self, client, symbols, interval):
+        super().__init__()
+        self.client = client
+        self.symbols = symbols
+        self.interval = interval
+
+    def run(self):
+        results = {}
+        for symbol in self.symbols:
+            data = self.get_historical_data(symbol)
+            if data is not None and not data.empty:
+                trend, signal = self.market_analysis(data)
+                decision = self.trading_decision(data, trend, signal)
+                results[symbol] = {
+                    "trend": trend,
+                    "signal": signal,
+                    "decision": decision
+                }
+        self.analysis_complete.emit(results)
+
+    def get_historical_data(self, symbol):
+        try:
+            klines = self.client.futures_klines(symbol=symbol, interval=self.interval, limit=100)
+            data = pd.DataFrame(klines, columns=[
+                "timestamp", "open", "high", "low", "close", "volume", 
+                "close_time", "quote_asset_volume", "number_of_trades", 
+                "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
+            ])
+            data["close"] = pd.to_numeric(data["close"])
+            data["high"] = pd.to_numeric(data["high"])
+            data["low"] = pd.to_numeric(data["low"])
+            data["volume"] = pd.to_numeric(data["volume"])
+            return data
+        except BinanceAPIException as e:
+            return None
+
+    def market_analysis(self, data):
+        if len(data) < 50:
+            return "Dữ liệu không đủ", "không"
+
+        macd = MACD(close=data["close"])
+        adx = ADXIndicator(high=data["high"], low=data["low"], close=data["close"])
+        rsi = RSIIndicator(close=data["close"])
+
+        latest_macd = macd.macd().iloc[-1]
+        latest_signal = macd.macd_signal().iloc[-1]
+        adx_value = adx.adx().iloc[-1]
+        rsi_value = rsi.rsi().iloc[-1]
+
+        if adx_value > 25:
+            if latest_macd > latest_signal and rsi_value < 70:
+                return "Tăng", "mua"
+            elif latest_macd < latest_signal and rsi_value > 30:
+                return "Giảm", "bán"
+        elif adx_value < 20:
+            return "Đi ngang", "không"
+        else:
+            return "Không ổn định", "không"
+
+    def trading_decision(self, data, trend, signal):
+        close_price = data["close"].iloc[-1]
+        atr = AverageTrueRange(high=data["high"], low=data["low"], close=data["close"])
+        latest_atr = atr.average_true_range().iloc[-1]
+
+        if signal == "mua":
+            tp = close_price + latest_atr * 2
+            sl = close_price - latest_atr * 2
+            return f"Mở lệnh mua.\n - Chốt lời (TP): {tp:.8f}\n - Cắt lỗ (SL): {sl:.8f}"
+        elif signal == "bán":
+            tp = close_price - latest_atr * 2
+            sl = close_price + latest_atr * 2
+            return f"Mở lệnh bán.\n - Chốt lời (TP): {tp:.8f}\n - Cắt lỗ (SL): {sl:.8f}"
+        else:
+            return "Không khuyến nghị hành động."
+
+
 class BinanceApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -66,9 +146,8 @@ class BinanceApp(QWidget):
         market_layout = QGridLayout()
 
         self.symbol_input = QLineEdit()
-        self.symbol_input.setPlaceholderText("Nhập mã đồng coin (ví dụ: BTCUSDT, ETHUSDT)")
+        self.symbol_input.setPlaceholderText("Nhập mã đồng coin (cách nhau bằng dấu phẩy, tối đa 10 đồng, ví dụ: BTCUSDT, ETHUSDT)")
         self.symbol_input.setFont(font)
-        self.symbol_input.textChanged.connect(self.validate_symbols)
 
         self.interval_combo = QComboBox()
         self.interval_combo.addItems(["4h", "1d"])
@@ -143,35 +222,27 @@ class BinanceApp(QWidget):
             QMessageBox.critical(self, "Lỗi", "API Key và Secret không được để trống.")
             return
 
-        # Tạo kết nối đến Binance API bằng các giá trị key và secret từ người dùng nhập
         self.client = Client(self.api_key, self.api_secret)
         try:
-            # Kiểm tra tính hợp lệ của API key và secret
             self.client.futures_account_balance()
             QMessageBox.information(self, "Thành Công", "API Key và Secret hợp lệ.")
-            self.save_api_credentials()  # Lưu thông tin API nếu cần
+            self.save_api_credentials()
         except BinanceAPIException as e:
             QMessageBox.critical(self, "Lỗi", f"API không hợp lệ: {e}")
-
-    def validate_symbols(self):
-        symbols_input = self.symbol_input.text().strip()
-        symbols = [s.strip().upper() for s in symbols_input.split(",")]
-        if len(symbols) > 10:
-            self.symbol_input.setStyleSheet("border: 1px solid red;")
-        else:
-            self.symbol_input.setStyleSheet("border: 1px solid green;")
 
     def analyze_market(self):
         if not self.client:
             QMessageBox.critical(self, "Lỗi", "Vui lòng xác minh API trước.")
             return
 
-        symbols_input = self.symbol_input.text().strip()
-        symbols = [s.strip().upper() for s in symbols_input.split(",")]
-
-        if not symbols or len(symbols) > 10:
-            QMessageBox.critical(self, "Lỗi", "Vui lòng nhập tối đa 10 đồng coin.")
+        symbols_input = self.symbol_input.text().strip().upper()
+        symbols = [s.strip() for s in symbols_input.split(",") if s.strip()]
+        
+        if len(symbols) == 0 or len(symbols) > 10:
+            QMessageBox.critical(self, "Lỗi", "Vui lòng nhập từ 1 đến 10 đồng coin.")
             return
+
+        interval = self.interval_combo.currentText()
 
         # Hiển thị hiệu ứng đang tải
         progress_dialog = QProgressDialog("Đang tải dữ liệu...", "Hủy", 0, 0, self)
@@ -179,100 +250,21 @@ class BinanceApp(QWidget):
         progress_dialog.setValue(0)
         QTimer.singleShot(1000, lambda: progress_dialog.setValue(50))
 
-        # Tạo một luồng riêng biệt để phân tích từng đồng coin
-        self.analysis_thread = MarketAnalysisThread(self.client, symbols, progress_dialog)
-        self.analysis_thread.update_result.connect(self.update_result)
+        self.result_text.clear()
+        self.analysis_thread = MarketAnalysisThread(self.client, symbols, interval)
+        self.analysis_thread.analysis_complete.connect(self.display_results)
         self.analysis_thread.start()
 
-    def update_result(self, result):
-        self.result_text.setText(result)
+        progress_dialog.show()
 
-
-class MarketAnalysisThread(QThread):
-    update_result = pyqtSignal(str)
-
-    def __init__(self, client, symbols, progress_dialog):
-        super().__init__()
-        self.client = client
-        self.symbols = symbols
-        self.progress_dialog = progress_dialog
-
-    def run(self):
-        result = ""
-        for idx, symbol in enumerate(self.symbols):
-            result += f"Đang phân tích {symbol}...\n"
-            data = self.get_historical_data(symbol)
-            if data is None or data.empty:
-                result += f"Không thể lấy dữ liệu cho {symbol}.\n"
-                continue
-
-            # Kiểm tra số lượng dữ liệu
-            if len(data) < 14:
-                result += f"Dữ liệu cho {symbol} không đủ để phân tích ADX.\n"
-                continue
-
-            trend, signal = self.market_analysis(data)
-            decision = self.trading_decision(data, trend, signal)
-
-            result += f"Phân tích cho {symbol}:\n" + \
-                      f" - Xu hướng thị trường: {trend}\n" + \
-                      f" - Tín hiệu giao dịch: {signal}\n" + \
-                      f" - Kết luận: {decision}\n\n"
-
-            self.update_result.emit(result)  # Cập nhật kết quả ra giao diện
-            QThread.msleep(500)  # Đợi một chút trước khi phân tích đồng tiếp theo
-
-    def get_historical_data(self, symbol):
-        try:
-            klines = self.client.futures_klines(symbol=symbol, interval="1d", limit=100)
-            data = pd.DataFrame(klines, columns=[
-                "timestamp", "open", "high", "low", "close", "volume", 
-                "close_time", "quote_asset_volume", "number_of_trades", 
-                "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
-            ])
-            data["close"] = pd.to_numeric(data["close"], errors='coerce')
-            data["high"] = pd.to_numeric(data["high"], errors='coerce')
-            data["low"] = pd.to_numeric(data["low"], errors='coerce')
-            data["volume"] = pd.to_numeric(data["volume"], errors='coerce')
-            return data.dropna(subset=["high", "low", "close"])
-        except BinanceAPIException as e:
-            return None
-
-    def market_analysis(self, data):
-        macd = MACD(close=data["close"])
-        adx = ADXIndicator(high=data["high"], low=data["low"], close=data["close"])
-        rsi = RSIIndicator(close=data["close"])
-
-        latest_macd = macd.macd().iloc[-1]
-        latest_signal = macd.macd_signal().iloc[-1]
-        adx_value = adx.adx().iloc[-1]
-        rsi_value = rsi.rsi().iloc[-1]
-
-        if adx_value > 25:
-            if latest_macd > latest_signal and rsi_value < 70:
-                return "Tăng", "mua"
-            elif latest_macd < latest_signal and rsi_value > 30:
-                return "Giảm", "bán"
-        elif adx_value < 20:
-            return "Đi ngang", "không"
-        else:
-            return "Không ổn định", "không"
-
-    def trading_decision(self, data, trend, signal):
-        close_price = data["close"].iloc[-1]
-        atr = AverageTrueRange(high=data["high"], low=data["low"], close=data["close"])
-        latest_atr = atr.average_true_range().iloc[-1]
-
-        if signal == "mua":
-            tp = close_price + latest_atr * 2
-            sl = close_price - latest_atr * 2
-            return f"Mở lệnh mua.\n - Chốt lời (TP): {tp:.8f}\n - Cắt lỗ (SL): {sl:.8f}"
-        elif signal == "bán":
-            tp = close_price - latest_atr * 2
-            sl = close_price + latest_atr * 2
-            return f"Mở lệnh bán.\n - Chốt lời (TP): {tp:.8f}\n - Cắt lỗ (SL): {sl:.8f}"
-        else:
-            return "Không khuyến nghị hành động."
+    def display_results(self, results):
+        output = ""
+        for symbol, analysis in results.items():
+            output += f"Phân tích cho {symbol}:\n" \
+                      f" - Xu hướng thị trường: {analysis['trend']}\n" \
+                      f" - Tín hiệu giao dịch: {analysis['signal']}\n" \
+                      f" - Kết luận: {analysis['decision']}\n\n"
+        self.result_text.setText(output)
 
 
 if __name__ == "__main__":
